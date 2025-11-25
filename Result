@@ -1,0 +1,12 @@
+Created a dummy pcap file: sample.pcap
+
+Successfully loaded 3 packets from sample.pcap
+
+Packet 1:
+  Source IP: 192.168.1.1, Destination IP: 192.168.1.2, Protocol: TCP
+------------------------------
+Packet 2:
+  Source IP: 192.168.1.2, Destination IP: 192.168.1.1, Protocol: TCP
+------------------------------
+Packet 3:
+  Source IP: 10.0.0.1, Destination IP: 10.0.0.2, Protocol: UDP
