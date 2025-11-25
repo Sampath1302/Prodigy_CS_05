@@ -1,0 +1,201 @@
+!pip install scapy
+"""
+packet_sniffer.py
+Simple educational packet sniffer that decodes Ethernet / IP / IPv6 / TCP / UDP / ICMP
+Displays: timestamp, src/dst IP, protocol, src/dst ports (when applicable), basic flags,
+and a hex + ASCII payload preview. Supports BPF filters and optional pcap saving.
+
+Usage examples:
+  sudo python3 packet_sniffer.py --iface eth0 --count 10
+  sudo python3 packet_sniffer.py --iface wlan0 --filter "tcp port 80" --save out.pcap
+  python3 packet_sniffer.py --readfile sample.pcap  # analyze pcap without live capture
+"""
+
+import argparse
+import sys
+import time
+import binascii
+from datetime import datetime
+
+try:
+    from scapy.all import (
+        sniff,
+        rdpcap,
+        wrpcap,
+        Ether,
+        IP,
+        IPv6,
+        TCP,
+        UDP,
+        ICMP,
+        Raw,
+        conf,
+    )
+except Exception as e:
+    print("Error: scapy is required. Install with `pip install scapy` and run again.")
+    raise
+
+def hexdump(data: bytes, length: int = 16) -> str:
+    """Return a hex + ascii dump similar to hexdump -C for the given bytes (first 256 bytes)."""
+    if not data:
+        return "<no payload>"
+    data = data[:256]
+    lines = []
+    for i in range(0, len(data), length):
+        chunk = data[i:i+length]
+        hex_bytes = " ".join(f"{b:02x}" for b in chunk)
+        hex_pairs = " ".join([hex_bytes[i:i+5] for i in range(0, len(hex_bytes), 5)])
+        ascii_bytes = "".join((chr(b) if 32 <= b <= 126 else ".") for b in chunk)
+        lines.append(f"{i:04x}  {hex_bytes:<{length*3}}  |{ascii_bytes}|")
+    return "\n".join(lines)
+
+def summarize_packet(pkt):
+    """Return a dictionary summary for a scapy packet."""
+    ts = datetime.fromtimestamp(pkt.time).isoformat(sep=' ', timespec='seconds')
+    proto = "Unknown"
+    src = dst = "-"
+    sport = dport = "-"
+    flags = ""
+    payload = b""
+
+    if pkt.haslayer(Ether):
+        l2 = pkt.getlayer(Ether)
+
+    if pkt.haslayer(IP):
+        ip = pkt.getlayer(IP)
+        proto = ip.proto
+        src = ip.src
+        dst = ip.dst
+        if pkt.haslayer(TCP):
+            tcp = pkt.getlayer(TCP)
+            proto = "TCP"
+            sport = tcp.sport
+            dport = tcp.dport
+            flags = tcp.flags
+            payload = bytes(tcp.payload) if tcp.payload else b""
+        elif pkt.haslayer(UDP):
+            udp = pkt.getlayer(UDP)
+            proto = "UDP"
+            sport = udp.sport
+            dport = udp.dport
+            payload = bytes(udp.payload) if udp.payload else b""
+        elif pkt.haslayer(ICMP):
+            icmp = pkt.getlayer(ICMP)
+            proto = "ICMP"
+            payload = bytes(icmp.payload) if icmp.payload else b""
+        else:
+            payload = bytes(ip.payload) if ip.payload else b""
+
+    elif pkt.haslayer(IPv6):
+        ip6 = pkt.getlayer(IPv6)
+        src = ip6.src
+        dst = ip6.dst
+        if pkt.haslayer(TCP):
+            tcp = pkt.getlayer(TCP)
+            proto = "TCPv6"
+            sport = tcp.sport
+            dport = tcp.dport
+            flags = tcp.flags
+            payload = bytes(tcp.payload) if tcp.payload else b""
+        elif pkt.haslayer(UDP):
+            udp = pkt.getlayer(UDP)
+            proto = "UDPv6"
+            sport = udp.sport
+            dport = udp.dport
+            payload = bytes(udp.payload) if udp.payload else b""
+        else:
+            proto = "IPv6/Other"
+            payload = bytes(ip6.payload) if ip6.payload else b""
+
+    else:
+        if pkt.haslayer(Raw):
+            payload = bytes(pkt.getlayer(Raw).load)
+        proto = pkt.__class__.__name__
+
+    return {
+        "timestamp": ts,
+        "protocol": proto,
+        "src": src,
+        "dst": dst,
+        "sport": sport,
+        "dport": dport,
+        "flags": str(flags),
+        "payload": payload,
+        "raw": pkt,
+    }
+
+def print_summary(s):
+    """Nicely print packet summary."""
+    print("="*80)
+    print(f"[{s['timestamp']}] {s['protocol']} {s['src']}:{s['sport']} -> {s['dst']}:{s['dport']}  flags={s['flags']}")
+    if s['payload']:
+        print("-- payload (hex/ascii preview) --")
+        print(hexdump(s['payload']))
+    else:
+        print("-- no payload --")
+
+def packet_handler(pkt, save_buffer=None):
+    """Function passed to scapy.sniff(); prints and optionally stores packets."""
+    s = summarize_packet(pkt)
+    print_summary(s)
+    if save_buffer is not None:
+        save_buffer.append(pkt)
+
+def live_capture(iface=None, count=0, bpf_filter=None, save_path=None, timeout=None):
+    """Capture live packets and optionally save to pcap."""
+    print(f"Starting live capture on iface={iface or 'default'} filter={bpf_filter or 'None'} count={count or 'infinite'}")
+    save_buf = []
+    try:
+        sniff_kwargs = dict(
+            iface=iface,
+            prn=lambda pkt: packet_handler(pkt, save_buffer=save_buf),
+            store=False,
+            filter=bpf_filter,
+            timeout=timeout,
+        )
+        if count and count > 0:
+            sniff_kwargs['count'] = count
+        sniff(**sniff_kwargs)
+    except PermissionError:
+        print("Permission error: you probably need to run as root/administrator to capture packets.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error during sniffing: {e}")
+        sys.exit(1)
+
+    if save_path and save_buf:
+        try:
+            wrpcap(save_path, save_buf)
+            print(f"Saved {len(save_buf)} packets to {save_path}")
+        except Exception as e:
+            print(f"Failed to save pcap: {e}")
+
+def analyze_pcap(file_path):
+    """Read a pcap and analyze packets (no live capture)."""
+    print(f"Reading pcap file: {file_path}")
+    try:
+        pkts = rdpcap(file_path)
+    except Exception as e:
+        print(f"Failed to read pcap: {e}")
+        sys.exit(1)
+    print(f"Loaded {len(pkts)} packets from {file_path}")
+    for p in pkts:
+        packet_handler(p)
+
+def main():
+    parser = argparse.ArgumentParser(description="Educational packet sniffer (use responsibly).")
+    parser.add_argument("--iface", "-i", help="Interface to capture on (default: scapy default)")
+    parser.add_argument("--count", "-c", type=int, default=0, help="Number of packets to capture (0 = unlimited)")
+    parser.add_argument("--filter", "-f", dest="bpf", help="BPF filter string (libpcap syntax), e.g. 'tcp port 80'")
+    parser.add_argument("--save", "-s", help="Save captured packets to pcap file")
+    parser.add_argument("--readfile", "-r", help="Read and analyze pcap file instead of live capture")
+    parser.add_argument("--timeout", "-t", type=int, help="Timeout in seconds for live sniffing")
+    args = parser.parse_args()
+
+    if args.readfile:
+        analyze_pcap(args.readfile)
+    else:
+        live_capture(iface=args.iface, count=args.count, bpf_filter=args.bpf, save_path=args.save, timeout=args.timeout)
+
+if __name__ == "__main__":
+    main()
